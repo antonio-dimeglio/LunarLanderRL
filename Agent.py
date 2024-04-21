@@ -4,10 +4,11 @@ import numpy as np
 from Models import *
 from collections import namedtuple
 import matplotlib.pyplot as plt
+import termcolor
 
 ROUNDING_PRECISION = 2
 
-Trace = namedtuple("Trace", ["reward", "values", "log_prob"])
+Trace = namedtuple("Trace", ["reward", "values", "log_prob", "entropy"])
 
 class Agent():
     """
@@ -23,11 +24,11 @@ class Agent():
     """
 
     def __init__(self, 
-                alpha: float = 1e-4, 
+                alpha: float = 0.01, 
                 beta: float = 1e-2, 
-                gamma: float = 0.99, 
-                model_type: str = "ACBoot",
-                n: int = 10) -> None:
+                gamma: float = 0.99,
+                model_type: str = "ACBootbaseline",
+                n: int = 5) -> None:
         self.env = gym.make("LunarLander-v2", continuous=False)
         self.alpha = alpha
         self.beta = beta
@@ -40,12 +41,12 @@ class Agent():
         match model_type:
             case "ACBoot" | "ACBaseline" | "ACBootbaseline":
                 self.model = ActorCritic(self.env.observation_space.shape[0], 128, self.env.action_space.n).to(self.device)
-                self.optimizer = th.optim.Adam(self.model.parameters(), lr=alpha)
             case "REINFORCE":
                 raise ValueError("Unimplemented model type.")
             case _:
                 raise ValueError("Invalid model type. Please choose from 'ACBoot', 'ACBaseline', 'ACBootbaseline' or 'REINFORCE'.")
-            
+        self.optimizer = th.optim.Adam(self.model.parameters(), lr=alpha)
+
     def __collect_trace(self) -> Trace:
         """
             Collect a trace from the environment.
@@ -60,22 +61,25 @@ class Agent():
         rewards = []
         values = []
         log_probs = []
+        entropies = []
 
         while not done:
             state = th.tensor(state, dtype=th.float32).to(self.device)
-            action, log_prob, value = self.model(state)
+            action, log_prob, value, entropy = self.model(state)
             next_state, reward, terminated, truncated, _ = self.env.step(action)
             rewards.append(reward)
             values.append(value)
             log_probs.append(log_prob)
+            entropies.append(entropy)
             state = next_state
             done = terminated or truncated
         
         rewards = th.tensor(rewards, dtype=th.float32).to(self.device)
         values = th.tensor(values, dtype=th.float32).to(self.device)
         log_probs = th.tensor(log_probs, dtype=th.float32).to(self.device)
+        entropies = th.tensor(entropies, dtype=th.float32).to(self.device)
 
-        return Trace(rewards, values, log_probs)
+        return Trace(rewards, values, log_probs, entropies)
     
     def __estimate_cumulative_return(self, rewards: th.Tensor, values: th.Tensor) -> th.Tensor:
         """
@@ -97,6 +101,25 @@ class Agent():
         
         return returns
     
+    def __compute_returns(self, rewards: th.Tensor) -> th.Tensor:
+        """
+            Compute the returns of the episode.
+
+            Args:
+                rewards (th.Tensor): The rewards of the episode.
+
+            Returns:
+                th.Tensor: The returns of the episode.
+        """
+        returns = th.zeros_like(rewards)
+        R = 0.0
+
+        for t in reversed(range(len(rewards))):
+            R = rewards[t] + self.gamma * R
+            returns[t] = R
+        
+        return returns
+    
     def __compute_critic_loss(self, returns: th.Tensor, values: th.Tensor) -> th.Tensor:
         """
             Compute the critic loss.
@@ -113,9 +136,13 @@ class Agent():
         for t in range(len(returns)):
             critic_loss += (returns[t] - values[t]) ** 2
         
-        return critic_loss
+        return critic_loss 
     
-    def __compute_actor_loss(self, returns: th.Tensor, values: th.Tensor, log_probs: th.Tensor) -> th.Tensor:
+    def __compute_actor_loss(self, returns: th.Tensor, 
+                            values: th.Tensor, 
+                            log_probs: th.Tensor, 
+                            entropies: th.Tensor,
+                            baseline: bool) -> th.Tensor:
         """
             Compute the actor loss.
 
@@ -128,12 +155,18 @@ class Agent():
                 th.Tensor: The actor loss.
         """
         actor_loss = th.tensor(0.0).to(self.device)
+        entropy_loss = th.tensor(0.0).to(self.device)
 
         for t in range(len(returns)):
-            advantage = returns[t] - values[t]
+            if baseline:
+                advantage = returns[t] - values[t]
+            else:
+                advantage = returns[t]
+
             actor_loss += -log_probs[t] * advantage
+            entropy_loss += entropies[t]
         
-        return actor_loss
+        return actor_loss - self.beta * entropy_loss
 
     
     def __ac_training(self, 
@@ -152,12 +185,15 @@ class Agent():
         """
         losses = np.zeros(m)
         total_rewards = np.zeros(m)
+        timesteps = 0
 
         for i in range(m):
+            
             trace = self.__collect_trace()
-            returns = self.__estimate_cumulative_return(trace.reward, trace.values)
-            actor_loss = self.__compute_actor_loss(returns, trace.values, trace.log_prob)
-            critic_loss = self.__compute_critic_loss(returns, trace.values)
+            returns = self.__estimate_cumulative_return(trace.reward, trace.values) if bootstrap else self.__compute_returns(trace.reward)
+            normalized_returns = (returns - returns.mean()) / (returns.std())
+            actor_loss = self.__compute_actor_loss(normalized_returns, trace.values, trace.log_prob, trace.entropy, baseline)
+            critic_loss = self.__compute_critic_loss(normalized_returns, trace.values)
             loss = th.tensor(actor_loss.clone().detach() + critic_loss.clone().detach(), requires_grad=True).to(self.device)
 
 
@@ -170,8 +206,15 @@ class Agent():
             if not quiet:
                 total_reward = sum(trace.reward)
                 total_rewards[i] = total_reward
-                print(f"Episode {i+1}/{m}\t\tLoss: {losses[i]:.{ROUNDING_PRECISION}f}\t\tReward: {total_reward:.{ROUNDING_PRECISION}f}")   
-        
+                print(f"Episode {i+1}/{m}\t\tLoss: {losses[i]:.{ROUNDING_PRECISION}f}\t\t", end="")
+                if total_reward > 0.0:
+                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "green"))
+                elif total_reward > -100.0:
+                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "yellow"))
+                else:
+                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "red"))
+
+            timesteps+=len(trace.reward)
 
         smoothed_rewards = np.convolve(total_rewards, np.ones(100)/100, mode="valid")
         plt.plot(smoothed_rewards)
@@ -179,7 +222,7 @@ class Agent():
         plt.ylabel("Total Reward")
         plt.title("Total Reward vs Episode")
         plt.savefig("Total_Reward_vs_Episode.png")
-
+        print(f"Total Timesteps: {timesteps}")
 
 
     def __reinforce_training(self, m: int, quiet: bool = False) -> None:
@@ -239,6 +282,6 @@ class Agent():
 
 
 if __name__ == "__main__":
-    agent = Agent()
-    agent.train(1500)
+    agent = Agent(model_type="ACBootbaseline")
+    agent.train(2000)
     # agent.visualize_agent()

@@ -25,5 +25,6 @@ class ActorCritic(nn.Module):
 
         action = Categorical(action_probs).sample().item()
         log_prob = th.log(action_probs[action])
+        entropy = -th.sum(action_probs * th.log(action_probs))
 
-        return action, log_prob, value
+        return action, log_prob, value, entropy 

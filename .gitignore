@@ -30,3 +30,4 @@ env/
 
 # Miscellaneous
 .DS_Store
+*.png
