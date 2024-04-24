@@ -2,286 +2,247 @@ import gymnasium as gym
 import torch as th
 import numpy as np
 from Models import *
-from collections import namedtuple
+from collections import namedtuple, deque
 import matplotlib.pyplot as plt
 import termcolor
+from enum import Enum
 
 ROUNDING_PRECISION = 2
 
-Trace = namedtuple("Trace", ["reward", "values", "log_prob", "entropy"])
+Trace = namedtuple("Trace", ["rewards", "values", "log_probs", "entropies"])
+Trace.__doc__ = "A named tuple for the traces of the agent."
+
+class AgentType(Enum):
+    """
+        The AgentType class is an enumeration class for the type of the agent model.
+
+        Attributes:
+            ACBaseline (int): The Actor-Critic model with Baseline Subtraction.
+            ACBoostrapping (int): The Actor-Critic model with Boostrapping.
+            ACBoostrappingBaseline (int): The Actor-Critic model with both Boostrapping and Baseline Subtraction.
+            REINFORCE (int): The REINFORCE model.
+    """
+    ACBaseline = 0
+    ACBoostrapping = 1
+    ACBoostrappingBaseline = 2
+    REINFORCE = 3
+
+
 
 class Agent():
     """
-        The Agent class for the LunarLander environment.
+        The Agent class for a gym environment, assuming that the environment is a discrete action space.
+        The Agent class is responsible for training the agent using the Actor-Critic or REINFORCE algorithm.
+        The Actor-Critic algorithm can be used either by only using Boostrapping, Baseline Subtraction or both.
 
         Args:
-            alpha (float): The learning rate of the agent, default is 1e-4.
-            beta (float): The entropy regularization term, default is 1e-2.
-            gamma (float): The discount factor, default is 0.999.
-            model_type (str): The type of model to use for the agent, which can be 
-                "ACBoot", "ACBaseline", "ACBootbaseline" or "REINFORCE", default is "ACBoot".
-            n (int): The number of steps to look ahead for the critic, default is 10.
+            alpha (float): The learning rate for the optimizer.
+            beta (float): The entropy coefficient for the loss function.
+            gamma (float): The discount factor for the rewards.
+            model (AgentType): The type of the agent model.
+            n_steps (int): The number of steps to boostrap the rewards.
+            environment (str): The name of the gym environment.
     """
-
-    def __init__(self, 
-                alpha: float = 0.01, 
-                beta: float = 1e-2, 
+    def __init__(self,
+                alpha: float = 0.001,
+                beta: float = 0.01, 
                 gamma: float = 0.99,
-                model_type: str = "ACBootbaseline",
-                n: int = 5) -> None:
-        self.env = gym.make("LunarLander-v2", continuous=False)
+                model: AgentType = AgentType.ACBoostrappingBaseline,
+                n_steps: int = 5,
+                environment: str = "LunarLander-v2") -> None:
+        
+
+        self.env = gym.make(environment, continuous = False)
+        self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+        match model:
+            case AgentType.ACBaseline | AgentType.ACBoostrapping | AgentType.ACBoostrappingBaseline:
+                self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
+                self.critic = Critic(self.env.observation_space.shape[0]).to(self.device)
+            case AgentType.REINFORCE:
+                self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
+            case _:
+                raise ValueError(f"Invalid model type: {model}.")
+        
+        self.actor_optimizer = th.optim.Adam(self.actor.parameters(), lr=alpha)
+        self.critic_optimizer = None if model == AgentType.REINFORCE else th.optim.Adam(self.critic.parameters(), lr=alpha)
+        
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
-        self.model_type = model_type
-        self.n = n
+        self.model = model
+        self.n_steps = n_steps
 
-        self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
-        match model_type:
-            case "ACBoot" | "ACBaseline" | "ACBootbaseline":
-                self.model = ActorCritic(self.env.observation_space.shape[0], 128, self.env.action_space.n).to(self.device)
-            case "REINFORCE":
-                raise ValueError("Unimplemented model type.")
-            case _:
-                raise ValueError("Invalid model type. Please choose from 'ACBoot', 'ACBaseline', 'ACBootbaseline' or 'REINFORCE'.")
-        self.optimizer = th.optim.Adam(self.model.parameters(), lr=alpha)
 
-    def __collect_trace(self) -> Trace:
-        """
-            Collect a trace from the environment.
-
-            Returns:
-                Trace: The trace of the episode.
-        """
-        
-        state, _ = self.env.reset()
-        done = False
-
+    def __get_trace(self) -> Trace:
         rewards = []
         values = []
         log_probs = []
         entropies = []
 
+        state, _ = self.env.reset()
+        done = False 
+
         while not done:
-            state = th.tensor(state, dtype=th.float32).to(self.device)
-            action, log_prob, value, entropy = self.model(state)
-            next_state, reward, terminated, truncated, _ = self.env.step(action)
+            state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
+            probs = self.actor(state)
+            value = self.critic(state) if self.model != AgentType.REINFORCE else None
+
+            dist = th.distributions.Categorical(probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            entropy = dist.entropy()
+
+            state, reward, terminated, truncated, _ = self.env.step(action.item())
+
             rewards.append(reward)
             values.append(value)
             log_probs.append(log_prob)
             entropies.append(entropy)
-            state = next_state
+
             done = terminated or truncated
-        
-        rewards = th.tensor(rewards, dtype=th.float32).to(self.device)
-        values = th.tensor(values, dtype=th.float32).to(self.device)
-        log_probs = th.tensor(log_probs, dtype=th.float32).to(self.device)
-        entropies = th.tensor(entropies, dtype=th.float32).to(self.device)
 
-        return Trace(rewards, values, log_probs, entropies)
-    
-    def __estimate_cumulative_return(self, rewards: th.Tensor, values: th.Tensor) -> th.Tensor:
+        return Trace(
+            th.tensor(rewards, dtype=th.float32, requires_grad=False).to(self.device),
+            th.tensor(values, dtype=th.float32, requires_grad=False).to(self.device) if self.model != AgentType.REINFORCE else None,
+            th.tensor(log_probs, dtype=th.float32, requires_grad=False).to(self.device),
+            th.tensor(entropies, dtype=th.float32, requires_grad=False).to(self.device)
+        )
+
+    def __get_cumulative_returns(self, rewards: th.Tensor, values: th.Tensor) -> th.Tensor:
         """
-            Estimate the cumulative return of the episode.
+            Calculate the cumulative returns of the agent.
 
             Args:
-                rewards (th.Tensor): The rewards of the episode.
-                values (th.Tensor): The values of the episode.
-
-            Returns:
-                th.Tensor: The cumulative return of the episode.
+                rewards (th.Tensor): The rewards of the agent.
+                values (th.Tensor): The values of the agent estimated by the Critic.
         """
-        returns = th.zeros_like(rewards)
+        cumulative_returns = th.zeros_like(rewards, dtype=th.float32, device=self.device, requires_grad=False)
         
-        for t in range(len(returns) - 1):
-            n = min(self.n, len(returns) - t - 1)
+        for t in range(len(cumulative_returns)):
+            n = min(self.n_steps, len(cumulative_returns) - t - 1)
             for k in range(n):
-                returns[t] += rewards[t+k] + values[t+n]
+                cumulative_returns[t] += rewards[t+k] + values[t+n]
         
-        return returns
-    
-    def __compute_returns(self, rewards: th.Tensor) -> th.Tensor:
-        """
-            Compute the returns of the episode.
+        return cumulative_returns
 
-            Args:
-                rewards (th.Tensor): The rewards of the episode.
-
-            Returns:
-                th.Tensor: The returns of the episode.
-        """
-        returns = th.zeros_like(rewards)
-        R = 0.0
+    def __get_returns(self, rewards:th.Tensor) -> th.Tensor:
+        returns = deque(maxsize=len(rewards))
+        R = 0
 
         for t in reversed(range(len(rewards))):
             R = rewards[t] + self.gamma * R
-            returns[t] = R
+            returns.appendleft(R)
+
+        return th.tensor(returns, dtype=th.float32, requires_grad=False).to(self.device)
+
+    def __get_critic_loss(self, cumulative_returns: th.Tensor, values:th.Tensor) -> th.Tensor:
+        critic_loss = th.tensor(0.0, dtype=th.float32, requires_grad=True).to(self.device)
+
+        for t in range(len(cumulative_returns)):
+            critic_loss += th.square(cumulative_returns[t] - values[t])
         
-        return returns
-    
-    def __compute_critic_loss(self, returns: th.Tensor, values: th.Tensor) -> th.Tensor:
+        return critic_loss
+
+
+    def __get_actor_loss(self, cumulative_returns: th.Tensor, log_probs:th.Tensor, entropies:th.Tensor, values: th.Tensor = None) -> th.Tensor:
+        if self.model == AgentType.ACBoostrappingBaseline:
+            advantages = cumulative_returns - values
+        elif self.model == AgentType.ACBoostrapping:
+            advantages = cumulative_returns
+
+        actor_loss = th.tensor(0.0, dtype=th.float32, requires_grad=True).to(self.device)
+
+        for t in range(len(cumulative_returns)):
+            actor_loss += -log_probs[t] * advantages[t] - self.beta * entropies[t]
+
+        return actor_loss
+
+
+
+    def train(self, m:int, quiet=False) -> np.ndarray:
         """
-            Compute the critic loss.
+            Train the agent for m episodes.
 
-            Args:
-                returns (th.Tensor): The returns of the episode.
-                values (th.Tensor): The values of the episode.
-
-            Returns:
-                th.Tensor: The critic loss.
-        """
-        critic_loss = th.tensor(0.0).to(self.device)
-
-        for t in range(len(returns)):
-            critic_loss += (returns[t] - values[t]) ** 2
-        
-        return critic_loss 
-    
-    def __compute_actor_loss(self, returns: th.Tensor, 
-                            values: th.Tensor, 
-                            log_probs: th.Tensor, 
-                            entropies: th.Tensor,
-                            baseline: bool) -> th.Tensor:
-        """
-            Compute the actor loss.
-
-            Args:
-                returns (th.Tensor): The returns of the episode.
-                values (th.Tensor): The values of the episode.
-                log_probs (th.Tensor): The log probabilities of the episode.
-
-            Returns:
-                th.Tensor: The actor loss.
-        """
-        actor_loss = th.tensor(0.0).to(self.device)
-        entropy_loss = th.tensor(0.0).to(self.device)
-
-        for t in range(len(returns)):
-            if baseline:
-                advantage = returns[t] - values[t]
-            else:
-                advantage = returns[t]
-
-            actor_loss += -log_probs[t] * advantage
-            entropy_loss += entropies[t]
-        
-        return actor_loss - self.beta * entropy_loss
-
-    
-    def __ac_training(self, 
-                    m: int, 
-                    quiet: bool = False,
-                    bootstrap: bool = False, 
-                    baseline:bool = False) -> None:
-        """
-            Training loop for the Actor-Critic model.
-            
             Args:
                 m (int): The number of episodes to train the agent.
-                quiet (bool): Whether to suppress the output of the training process.
-                bootstrap (bool): Whether to use bootstrapping for the critic.
-                baseline (bool): Whether to use a baseline for the critic.
+                quiet (bool): Whether to print training trajectory.
+
+            Returns:
+                np.ndarray: The rewards of the agent for each episode.
         """
-        losses = np.zeros(m)
-        total_rewards = np.zeros(m)
-        timesteps = 0
+        
+        rewards_per_episode = np.zeros(m, dtype=np.float32)
+
 
         for i in range(m):
-            
-            trace = self.__collect_trace()
-            returns = self.__estimate_cumulative_return(trace.reward, trace.values) if bootstrap else self.__compute_returns(trace.reward)
-            normalized_returns = (returns - returns.mean()) / (returns.std())
-            actor_loss = self.__compute_actor_loss(normalized_returns, trace.values, trace.log_prob, trace.entropy, baseline)
-            critic_loss = self.__compute_critic_loss(normalized_returns, trace.values)
-            loss = th.tensor(actor_loss.clone().detach() + critic_loss.clone().detach(), requires_grad=True).to(self.device)
+            trace = self.__get_trace()
+            if self.model == AgentType.ACBoostrapping or self.model == AgentType.ACBoostrappingBaseline:
+                returns = self.__get_cumulative_returns(trace.rewards, trace.values)
+            else:
+                returns = self.__get_returns(trace.rewards)
 
+            normalized_returns = (returns - returns.mean()) / (returns.std() + 1e-10)
+            actor_loss = self.__get_actor_loss(normalized_returns, trace.log_probs, trace.entropies, trace.values)
+            actor_loss_value = actor_loss.item()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            if self.model != AgentType.REINFORCE:
+                
+                critic_loss = self.__get_critic_loss(normalized_returns, trace.values)
 
-            losses[i] = loss.item()
+                # Normalize the critic loss
+                critic_loss_value = critic_loss.item()
+                
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic_optimizer.step()
+
+                del critic_loss
+
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            del actor_loss
+
+            rewards_per_episode[i] = sum(trace.rewards)
 
             if not quiet:
-                total_reward = sum(trace.reward)
-                total_rewards[i] = total_reward
-                print(f"Episode {i+1}/{m}\t\tLoss: {losses[i]:.{ROUNDING_PRECISION}f}\t\t", end="")
-                if total_reward > 0.0:
-                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "green"))
-                elif total_reward > -100.0:
-                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "yellow"))
+                print(f"Episode {i}/{m}", end="\t")
+                if self.model != AgentType.REINFORCE:
+                    print(f"Actor Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}\tCritic Loss: {critic_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
                 else:
-                    print(termcolor.colored(f"Total Reward: {total_reward:.{ROUNDING_PRECISION}f}", "red"))
+                    print(f"Model Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
 
-            timesteps+=len(trace.reward)
+                print("Reward: ", end="")
+                if rewards_per_episode[i] > 0.0:
+                    print(termcolor.colored(f"{rewards_per_episode[i]}", "green"))
+                elif rewards_per_episode[i] > -100.0:
+                    print(termcolor.colored(f"{rewards_per_episode[i]}", "yellow"))
+                else:
+                    print(termcolor.colored(f"{rewards_per_episode[i]}", "red"))
 
-        smoothed_rewards = np.convolve(total_rewards, np.ones(100)/100, mode="valid")
-        plt.plot(smoothed_rewards)
-        plt.xlabel("Episode")
-        plt.ylabel("Total Reward")
-        plt.title("Total Reward vs Episode")
-        plt.savefig("Total_Reward_vs_Episode.png")
-        print(f"Total Timesteps: {timesteps}")
-
-
-    def __reinforce_training(self, m: int, quiet: bool = False) -> None:
-        """
-            Training loop for the REINFORCE model.
-
-            Args:
-                m (int): The number of episodes to train the agent.
-                quiet (bool): Whether to suppress the output of the training process.
-        """
-        pass 
+        return rewards_per_episode
 
 
+    def visualize_agent(self, trials:int = 20) -> None:
+        self.env = gym.make("LunarLander-v2", continuous = False, render_mode = "human")
 
-
-    def train(self, m: int, quiet: bool = False) -> None:
-        """
-            Entry point for training the agent.
-
-            Args:
-                m (int): The number of episodes to train the agent.
-                quiet (bool): Whether to suppress the output of the training process.
-        """
-
-        match self.model_type:
-            case "ACBoot":
-                self.__ac_training(m, quiet, bootstrap=True)
-            case "ACBaseline":
-                self.__ac_training(m, quiet, baseline=True)
-            case "ACBootbaseline":
-                self.__ac_training(m, quiet, bootstrap=True, baseline=True)
-            case "REINFORCE":
-                self.__reinforce_training(m, quiet)
-            case _:
-                raise ValueError("Invalid model type. Please choose from 'ACBoot', 'ACBaseline', 'ACBootbaseline' or 'REINFORCE'.")
-
-
-    def visualize_agent(self) -> None:
-        """
-            Visualize the agent in the environment.
-        """
-        self.env = gym.make("LunarLander-v2", continuous=False, render_mode = "human")
-        while True:
+        for i in range(trials):
             state, _ = self.env.reset()
             done = False
 
             while not done:
+                state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
+                probs = self.actor(state)
+                dist = th.distributions.Categorical(probs)
+                action = dist.sample()
+                state, _, done, _, _ = self.env.step(action.item())
                 self.env.render()
-                state = th.tensor(state, dtype=th.float32).to(self.device)
-                action, _, _ = self.model(state)
-                next_state, _, terminated, truncated, _ = self.env.step(action)
-                state = next_state
-                done = terminated or truncated
-            
-            self.env.close()    
 
 
 
 if __name__ == "__main__":
-    agent = Agent(model_type="ACBootbaseline")
-    agent.train(2000)
-    # agent.visualize_agent()
+    agent = Agent()
+    agent.train(10000)
