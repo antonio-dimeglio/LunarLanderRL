@@ -42,14 +42,17 @@ class Agent():
             model (AgentType): The type of the agent model.
             n_steps (int): The number of steps to boostrap the rewards.
             environment (str): The name of the gym environment.
+            minibatch_size (int): The size of the minibatch for the training, setting this value to None 
+                                    will disable the minibatch training.
     """
     def __init__(self,
-                alpha: float = 0.001,
+                alpha: float = 0.01,
                 beta: float = 0.01, 
                 gamma: float = 0.99,
                 model: AgentType = AgentType.ACBoostrappingBaseline,
                 n_steps: int = 5,
-                environment: str = "LunarLander-v2") -> None:
+                environment: str = "LunarLander-v2",
+                minibatch_size: int = None) -> None:
         
 
         self.env = gym.make(environment, continuous = False)
@@ -72,7 +75,11 @@ class Agent():
         self.gamma = gamma
         self.model = model
         self.n_steps = n_steps
+        self.minibatch_size = minibatch_size
 
+        if minibatch_size is not None:
+            self.done = False 
+            self.state = None
 
 
     def __get_trace(self) -> Trace:
@@ -96,12 +103,56 @@ class Agent():
 
             state, reward, terminated, truncated, _ = self.env.step(action.item())
 
-            rewards.append(reward)
+            rewards.append(abs(reward))
             values.append(value)
             log_probs.append(log_prob)
             entropies.append(entropy)
 
             done = terminated or truncated
+
+        return Trace(
+            th.tensor(rewards, dtype=th.float32, requires_grad=False).to(self.device),
+            th.tensor(values, dtype=th.float32, requires_grad=False).to(self.device) if self.model != AgentType.REINFORCE else None,
+            th.tensor(log_probs, dtype=th.float32, requires_grad=False).to(self.device),
+            th.tensor(entropies, dtype=th.float32, requires_grad=False).to(self.device)
+        )
+    
+    def __get_minibatch_trace(self) -> Trace:
+        rewards = []
+        values = []
+        log_probs = []
+        entropies = []
+
+        if self.done or self.state is None:
+            self.done = False
+            state, _ = self.env.reset()
+        else:
+            state = self.state 
+
+        for _ in range(self.minibatch_size):
+            state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
+            probs = self.actor(state)
+            value = self.critic(state) if self.model != AgentType.REINFORCE else None
+
+            dist = th.distributions.Categorical(probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            entropy = dist.entropy()
+
+            state, reward, terminated, truncated, _ = self.env.step(action.item())
+
+            rewards.append(reward)
+            values.append(value)
+            log_probs.append(log_prob)
+            entropies.append(entropy)
+
+            self.done = terminated or truncated
+
+            if self.done:
+                self.done = False
+                state, _ = self.env.reset()
+                
+        self.state = state
 
         return Trace(
             th.tensor(rewards, dtype=th.float32, requires_grad=False).to(self.device),
@@ -128,7 +179,7 @@ class Agent():
         return cumulative_returns
 
     def __get_returns(self, rewards:th.Tensor) -> th.Tensor:
-        returns = deque(maxsize=len(rewards))
+        returns = deque(maxlen=len(rewards))
         R = 0
 
         for t in reversed(range(len(rewards))):
@@ -147,9 +198,9 @@ class Agent():
 
 
     def __get_actor_loss(self, cumulative_returns: th.Tensor, log_probs:th.Tensor, entropies:th.Tensor, values: th.Tensor = None) -> th.Tensor:
-        if self.model == AgentType.ACBoostrappingBaseline:
+        if self.model == AgentType.ACBoostrappingBaseline or self.model == AgentType.ACBaseline:
             advantages = cumulative_returns - values
-        elif self.model == AgentType.ACBoostrapping:
+        else:
             advantages = cumulative_returns
 
         actor_loss = th.tensor(0.0, dtype=th.float32, requires_grad=True).to(self.device)
@@ -177,19 +228,18 @@ class Agent():
 
 
         for i in range(m):
-            trace = self.__get_trace()
+            trace = self.__get_trace() if self.minibatch_size is None else self.__get_minibatch_trace()
             if self.model == AgentType.ACBoostrapping or self.model == AgentType.ACBoostrappingBaseline:
                 returns = self.__get_cumulative_returns(trace.rewards, trace.values)
             else:
                 returns = self.__get_returns(trace.rewards)
 
-            normalized_returns = (returns - returns.mean()) / (returns.std() + 1e-10)
-            actor_loss = self.__get_actor_loss(normalized_returns, trace.log_probs, trace.entropies, trace.values)
+            actor_loss = self.__get_actor_loss(returns, trace.log_probs, trace.entropies, trace.values)
             actor_loss_value = actor_loss.item()
 
             if self.model != AgentType.REINFORCE:
                 
-                critic_loss = self.__get_critic_loss(normalized_returns, trace.values)
+                critic_loss = self.__get_critic_loss(returns, trace.values)
 
                 # Normalize the critic loss
                 critic_loss_value = critic_loss.item()
@@ -208,20 +258,21 @@ class Agent():
 
             rewards_per_episode[i] = sum(trace.rewards)
 
-            if not quiet:
+            if not quiet and i % 10 == 0:
                 print(f"Episode {i}/{m}", end="\t")
                 if self.model != AgentType.REINFORCE:
                     print(f"Actor Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}\tCritic Loss: {critic_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
                 else:
                     print(f"Model Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
 
-                print("Reward: ", end="")
-                if rewards_per_episode[i] > 0.0:
-                    print(termcolor.colored(f"{rewards_per_episode[i]}", "green"))
-                elif rewards_per_episode[i] > -100.0:
-                    print(termcolor.colored(f"{rewards_per_episode[i]}", "yellow"))
+                print("Total average reward: ", end="")
+                avg_reward = np.mean(rewards_per_episode[:i])
+                if avg_reward > 0.0:
+                    print(termcolor.colored(f"{avg_reward}", "green"))
+                elif avg_reward > -100.0:
+                    print(termcolor.colored(f"{avg_reward}", "yellow"))
                 else:
-                    print(termcolor.colored(f"{rewards_per_episode[i]}", "red"))
+                    print(termcolor.colored(f"{avg_reward}", "red"))
 
         return rewards_per_episode
 
@@ -244,5 +295,14 @@ class Agent():
 
 
 if __name__ == "__main__":
-    agent = Agent()
-    agent.train(10000)
+    agent = Agent(model=AgentType.ACBoostrappingBaseline, minibatch_size=5)
+    rewards = agent.train(10000)
+    agent.visualize_agent()
+
+    smoothed_rewards = np.convolve(rewards, np.ones(100)/100, mode="valid")
+
+    plt.plot(smoothed_rewards)
+    plt.title("Rewards")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.savefig("rewards.png")
