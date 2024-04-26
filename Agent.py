@@ -9,7 +9,7 @@ from enum import Enum
 
 ROUNDING_PRECISION = 2
 
-Trace = namedtuple("Trace", ["rewards", "values", "log_probs", "entropies"])
+Trace = namedtuple("Trace", ["rewards", "values", "log_probs"])
 Trace.__doc__ = "A named tuple for the traces of the agent."
 
 class AgentType(Enum):
@@ -27,8 +27,6 @@ class AgentType(Enum):
     ACBoostrappingBaseline = 2
     REINFORCE = 3
 
-
-
 class Agent():
     """
         The Agent class for a gym environment, assuming that the environment is a discrete action space.
@@ -42,28 +40,26 @@ class Agent():
             model (AgentType): The type of the agent model.
             n_steps (int): The number of steps to boostrap the rewards.
             environment (str): The name of the gym environment.
-            minibatch_size (int): The size of the minibatch for the training, setting this value to None 
-                                    will disable the minibatch training.
     """
-    def __init__(self,
-                alpha: float = 0.01,
-                beta: float = 0.01, 
-                gamma: float = 0.99,
-                model: AgentType = AgentType.ACBoostrappingBaseline,
-                n_steps: int = 5,
-                environment: str = "LunarLander-v2",
-                minibatch_size: int = None) -> None:
-        
 
+    def __init__(self,
+                    alpha: float = 1e-4,
+                    beta: float = 0.01,
+                    gamma: float = 0.99,
+                    model: AgentType = AgentType.ACBoostrappingBaseline,
+                    environment: str = "LunarLander-v2",
+                    n_steps: int = 5):
+    
         self.env = gym.make(environment, continuous = False)
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
+        self.action_space = self.env.action_space.n
 
         match model:
             case AgentType.ACBaseline | AgentType.ACBoostrapping | AgentType.ACBoostrappingBaseline:
-                self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
+                self.actor = Actor(self.env.observation_space.shape[0], self.action_space).to(self.device)
                 self.critic = Critic(self.env.observation_space.shape[0]).to(self.device)
             case AgentType.REINFORCE:
-                self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
+                self.actor = Actor(self.env.observation_space.shape[0], self.action_space).to(self.device)
             case _:
                 raise ValueError(f"Invalid model type: {model}.")
         
@@ -75,142 +71,158 @@ class Agent():
         self.gamma = gamma
         self.model = model
         self.n_steps = n_steps
-        self.minibatch_size = minibatch_size
-
-        if minibatch_size is not None:
-            self.done = False 
-            self.state = None
 
 
-    def __get_trace(self) -> Trace:
+    def __get_trace(self) -> tuple[Trace, float]:
+        """
+            The private method to get the trace of the agent.
+
+            Returns:
+                Trace: The trace of the agent.
+                float: The entropy of the trace.
+        """
+
         rewards = []
         values = []
         log_probs = []
-        entropies = []
+        entropy = 0.0
 
         state, _ = self.env.reset()
-        done = False 
+        done = False
 
         while not done:
-            state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
+            state = th.from_numpy(state).to(self.device)
+
             probs = self.actor(state)
-            value = self.critic(state) if self.model != AgentType.REINFORCE else None
+            value = self.critic(state).item() if self.model != AgentType.REINFORCE else 0.0
 
-            dist = th.distributions.Categorical(probs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            entropy = dist.entropy()
-
-            state, reward, terminated, truncated, _ = self.env.step(action.item())
-
-            rewards.append(abs(reward))
-            values.append(value)
-            log_probs.append(log_prob)
-            entropies.append(entropy)
-
-            done = terminated or truncated
-
-        return Trace(
-            th.tensor(rewards, dtype=th.float32, requires_grad=False).to(self.device),
-            th.tensor(values, dtype=th.float32, requires_grad=False).to(self.device) if self.model != AgentType.REINFORCE else None,
-            th.tensor(log_probs, dtype=th.float32, requires_grad=False).to(self.device),
-            th.tensor(entropies, dtype=th.float32, requires_grad=False).to(self.device)
-        )
-    
-    def __get_minibatch_trace(self) -> Trace:
-        rewards = []
-        values = []
-        log_probs = []
-        entropies = []
-
-        if self.done or self.state is None:
-            self.done = False
-            state, _ = self.env.reset()
-        else:
-            state = self.state 
-
-        for _ in range(self.minibatch_size):
-            state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
-            probs = self.actor(state)
-            value = self.critic(state) if self.model != AgentType.REINFORCE else None
-
-            dist = th.distributions.Categorical(probs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            entropy = dist.entropy()
-
-            state, reward, terminated, truncated, _ = self.env.step(action.item())
+            action = np.random.choice(self.action_space, p=probs.cpu().detach().numpy())
+            log_prob = th.log(probs[action])
+            log_probs.append(log_prob.item())
+            
+            entropy += -(probs * th.log(probs)).sum().item()
+            
+            state, reward, terminated, truncated, _ = self.env.step(action)
 
             rewards.append(reward)
             values.append(value)
-            log_probs.append(log_prob)
-            entropies.append(entropy)
 
-            self.done = terminated or truncated
+            done = terminated or truncated
+        
+        rewards = np.array(rewards, dtype=np.float32)
+        values = np.array(values, dtype=np.float32)
+        log_probs = np.array(log_probs, dtype=np.float32)
 
-            if self.done:
-                self.done = False
-                state, _ = self.env.reset()
-                
-        self.state = state
-
-        return Trace(
-            th.tensor(rewards, dtype=th.float32, requires_grad=False).to(self.device),
-            th.tensor(values, dtype=th.float32, requires_grad=False).to(self.device) if self.model != AgentType.REINFORCE else None,
-            th.tensor(log_probs, dtype=th.float32, requires_grad=False).to(self.device),
-            th.tensor(entropies, dtype=th.float32, requires_grad=False).to(self.device)
-        )
-
-    def __get_cumulative_returns(self, rewards: th.Tensor, values: th.Tensor) -> th.Tensor:
+        return Trace(rewards, values, log_probs), entropy
+        
+    def __get_discounted_rewards(self, rewards: np.ndarray) -> np.ndarray:
         """
-            Calculate the cumulative returns of the agent.
+            The private method to get the discounted rewards.
 
             Args:
-                rewards (th.Tensor): The rewards of the agent.
-                values (th.Tensor): The values of the agent estimated by the Critic.
+                rewards (np.ndarray): The rewards of the agent.
+
+            Returns:
+                np.ndarray: The discounted rewards.
         """
-        cumulative_returns = th.zeros_like(rewards, dtype=th.float32, device=self.device, requires_grad=False)
-        
+
+        discounted_rewards = np.zeros_like(rewards, dtype=np.float32)
+        running_add = 0.0
+
+        for i in reversed(range(len(rewards))):
+            running_add = running_add * self.gamma + rewards[i]
+            discounted_rewards[i] = running_add
+
+        return discounted_rewards
+
+    def __get_cumulative_returns(self, rewards: np.ndarray, values: np.ndarray) -> np.ndarray:
+        """
+            The private method to get the cumulative returns.
+
+            Args:
+                rewards (np.ndarray): The rewards of the agent.
+                values (np.ndarray): The values of the agent.
+
+            Returns:
+                np.ndarray: The cumulative returns.
+        """
+
+        cumulative_returns = np.zeros_like(rewards, dtype=np.float32)
+
         for t in range(len(cumulative_returns)):
             n = min(self.n_steps, len(cumulative_returns) - t - 1)
             for k in range(n):
                 cumulative_returns[t] += rewards[t+k] + values[t+n]
-        
+
         return cumulative_returns
+    
+    def __get_actor_loss(self, returns: np.ndarray, log_probs: np.ndarray, values: np.ndarray, entropy: float) -> th.Tensor:
+        """
+            The private method to get the actor loss.
 
-    def __get_returns(self, rewards:th.Tensor) -> th.Tensor:
-        returns = deque(maxlen=len(rewards))
-        R = 0
+            Args:
+                returns (np.ndarray): The returns of the agent.
+                log_probs (np.ndarray): The log probabilities of the agent.
+                values (np.ndarray): The values of the agent.
+                entropy (float): The entropy of the agent.
 
-        for t in reversed(range(len(rewards))):
-            R = rewards[t] + self.gamma * R
-            returns.appendleft(R)
+            Returns:
+                th.Tensor: The actor loss.
+        """
 
-        return th.tensor(returns, dtype=th.float32, requires_grad=False).to(self.device)
+        actor_loss = 0.0
 
-    def __get_critic_loss(self, cumulative_returns: th.Tensor, values:th.Tensor) -> th.Tensor:
-        critic_loss = th.tensor(0.0, dtype=th.float32, requires_grad=True).to(self.device)
-
-        for t in range(len(cumulative_returns)):
-            critic_loss += th.square(cumulative_returns[t] - values[t])
         
+        for i in range(len(returns)):
+            if self.model == AgentType.REINFORCE:
+                actor_loss += -log_probs[i] * returns[i]
+            else:
+                advantage = returns[i] - values[i]
+                actor_loss += -log_probs[i] * advantage
+
+        actor_loss = actor_loss - self.beta * entropy
+
+        return th.tensor(actor_loss, dtype=th.float32, device=self.device, requires_grad=True)
+    
+    def __get_critic_loss(self, returns: np.ndarray, values: np.ndarray) -> th.Tensor:
+        """
+            The private method to get the critic loss.
+
+            Args:
+                returns (np.ndarray): The returns of the agent.
+                values (np.ndarray): The values of the agent.
+
+            Returns:
+                th.Tensor: The critic loss.
+        """
+
+        critic_loss = th.tensor(np.sum((returns - values) ** 2), dtype=th.float32, device=self.device, requires_grad=True)
+
         return critic_loss
+    
+    def __print_training_trajectory(self, i: int, m:int, actor_loss: th.Tensor, critic_loss: th.Tensor, rewards: np.ndarray, entropy:float) -> None:
+        """
+            The private method to print the training trajectory.
 
+            Args:
+                i (int): The current episode.
+                actor_loss (th.Tensor): The actor loss.
+                critic_loss (th.Tensor): The critic loss.
+                rewards (np.ndarray): The rewards of the agent.
+                entropy (float): The entropy of the agent.
+        """
 
-    def __get_actor_loss(self, cumulative_returns: th.Tensor, log_probs:th.Tensor, entropies:th.Tensor, values: th.Tensor = None) -> th.Tensor:
-        if self.model == AgentType.ACBoostrappingBaseline or self.model == AgentType.ACBaseline:
-            advantages = cumulative_returns - values
+        print(f"Episode {i}/{m}", end="\t")
+        if self.model != AgentType.REINFORCE:
+            print(f"Actor Loss: {actor_loss:.{ROUNDING_PRECISION}f}\tCritic Loss: {critic_loss:.{ROUNDING_PRECISION}f}", end="\t")
         else:
-            advantages = cumulative_returns
+            print(f"Model Loss: {actor_loss:.{ROUNDING_PRECISION}f}", end="\t")
 
-        actor_loss = th.tensor(0.0, dtype=th.float32, requires_grad=True).to(self.device)
-
-        for t in range(len(cumulative_returns)):
-            actor_loss += -log_probs[t] * advantages[t] - self.beta * entropies[t]
-
-        return actor_loss
-
-
+        print("Current average reward: ", end="")
+        avg_reward = np.round(np.mean(rewards), ROUNDING_PRECISION)
+        color = "green" if avg_reward > 0 else "yellow" if avg_reward > -100.0 else "red" 
+        print(termcolor.colored(avg_reward, color), end="\t")
+        print(f"Entropy: {entropy:.{ROUNDING_PRECISION}f}")
 
     def train(self, m:int, quiet=False) -> np.ndarray:
         """
@@ -223,86 +235,51 @@ class Agent():
             Returns:
                 np.ndarray: The rewards of the agent for each episode.
         """
-        
+
         rewards_per_episode = np.zeros(m, dtype=np.float32)
 
 
         for i in range(m):
-            trace = self.__get_trace() if self.minibatch_size is None else self.__get_minibatch_trace()
+            trace, entropy = self.__get_trace()
+
             if self.model == AgentType.ACBoostrapping or self.model == AgentType.ACBoostrappingBaseline:
                 returns = self.__get_cumulative_returns(trace.rewards, trace.values)
             else:
-                returns = self.__get_returns(trace.rewards)
+                returns = self.__get_discounted_rewards(trace.rewards)
 
-            actor_loss = self.__get_actor_loss(returns, trace.log_probs, trace.entropies, trace.values)
-            actor_loss_value = actor_loss.item()
-
-            if self.model != AgentType.REINFORCE:
-                
-                critic_loss = self.__get_critic_loss(returns, trace.values)
-
-                # Normalize the critic loss
-                critic_loss_value = critic_loss.item()
-                
-                self.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                self.critic_optimizer.step()
-
-                del critic_loss
+            actor_loss = self.__get_actor_loss(returns, trace.log_probs, trace.values, entropy)
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
 
-            del actor_loss
+            if self.model != AgentType.REINFORCE:
+                critic_loss = self.__get_critic_loss(returns, trace.values)
+                
+                self.critic_optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic_optimizer.step()
 
-            rewards_per_episode[i] = sum(trace.rewards)
+            rewards_per_episode[i] = np.sum(trace.rewards)
 
-            if not quiet and i % 10 == 0:
-                print(f"Episode {i}/{m}", end="\t")
-                if self.model != AgentType.REINFORCE:
-                    print(f"Actor Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}\tCritic Loss: {critic_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
-                else:
-                    print(f"Model Loss: {actor_loss_value:.{ROUNDING_PRECISION}f}", end="\t")
-
-                print("Total average reward: ", end="")
-                avg_reward = np.mean(rewards_per_episode[:i])
-                if avg_reward > 0.0:
-                    print(termcolor.colored(f"{avg_reward}", "green"))
-                elif avg_reward > -100.0:
-                    print(termcolor.colored(f"{avg_reward}", "yellow"))
-                else:
-                    print(termcolor.colored(f"{avg_reward}", "red"))
+            if not quiet and i % 10 == 0 and i != 0:
+                self.__print_training_trajectory(i, 
+                        m, 
+                        actor_loss, 
+                        critic_loss if self.model != AgentType.REINFORCE else None, 
+                        rewards_per_episode, 
+                        entropy)
 
         return rewards_per_episode
-
-
-    def visualize_agent(self, trials:int = 20) -> None:
-        self.env = gym.make("LunarLander-v2", continuous = False, render_mode = "human")
-
-        for i in range(trials):
-            state, _ = self.env.reset()
-            done = False
-
-            while not done:
-                state = th.tensor(state, dtype=th.float32, requires_grad=False).to(self.device)
-                probs = self.actor(state)
-                dist = th.distributions.Categorical(probs)
-                action = dist.sample()
-                state, _, done, _, _ = self.env.step(action.item())
-                self.env.render()
-
-
+    
 
 if __name__ == "__main__":
-    agent = Agent(model=AgentType.ACBoostrappingBaseline, minibatch_size=5)
-    rewards = agent.train(10000)
-    agent.visualize_agent()
+    agent = Agent(model=AgentType.ACBoostrappingBaseline)
+    rewards = agent.train(5000)
 
-    smoothed_rewards = np.convolve(rewards, np.ones(100)/100, mode="valid")
+    smoothed_rewards = np.convolve(rewards, np.ones((100,))/100, mode="valid")
 
-    plt.plot(smoothed_rewards)
-    plt.title("Rewards")
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
+    plt.plot(rewards)
+    plt.xlabel("Episodes")
+    plt.ylabel("Rewards")
     plt.savefig("rewards.png")
