@@ -1,8 +1,8 @@
 import torch.nn as nn
 
-class Actor(nn.Module):
+class Policy(nn.Module):
     def __init__(self, input_size:int, output_size:int) -> None:
-        super(Actor, self).__init__()
+        super(Policy, self).__init__()
 
         self.layer = nn.Sequential(
             nn.Linear(input_size, 64),

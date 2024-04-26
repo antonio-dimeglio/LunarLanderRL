@@ -2,15 +2,12 @@ import gymnasium as gym
 import torch as th
 import numpy as np
 from Models import *
-from collections import namedtuple, deque
+from collections import namedtuple
 import matplotlib.pyplot as plt
 import termcolor
 from enum import Enum
 
 ROUNDING_PRECISION = 2
-
-Trace = namedtuple("Trace", ["rewards", "values", "log_probs"])
-Trace.__doc__ = "A named tuple for the traces of the agent."
 
 class AgentType(Enum):
     """
@@ -34,171 +31,65 @@ class Agent():
         The Actor-Critic algorithm can be used either by only using Boostrapping, Baseline Subtraction or both.
 
         Args:
-            alpha (float): The learning rate for the optimizer.
+            alpha_policy (float): The learning rate for the optimizer for the policy model.
+            alpha_critic (float): The learning rate for the optimizer for the critic model.
             beta (float): The entropy coefficient for the loss function.
             gamma (float): The discount factor for the rewards.
-            model (AgentType): The type of the agent model.
+            agent_type (AgentType): The type of the agent model.
             n_steps (int): The number of steps to boostrap the rewards.
             environment (str): The name of the gym environment.
     """
 
     def __init__(self,
-                    alpha: float = 1e-4,
-                    beta: float = 0.01,
-                    gamma: float = 0.99,
-                    model: AgentType = AgentType.ACBoostrappingBaseline,
-                    environment: str = "LunarLander-v2",
-                    n_steps: int = 5):
-    
-        self.env = gym.make(environment, continuous = False)
-        self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
-        self.action_space = self.env.action_space.n
-
-        match model:
-            case AgentType.ACBaseline | AgentType.ACBoostrapping | AgentType.ACBoostrappingBaseline:
-                self.actor = Actor(self.env.observation_space.shape[0], self.action_space).to(self.device)
-                self.critic = Critic(self.env.observation_space.shape[0]).to(self.device)
-            case AgentType.REINFORCE:
-                self.actor = Actor(self.env.observation_space.shape[0], self.action_space).to(self.device)
-            case _:
-                raise ValueError(f"Invalid model type: {model}.")
+        alpha_policy:float = 0.001,
+        alpha_critic:float = 0.01,
+        beta:float = 0.01,
+        gamma:float = 0.99,
+        agent_type:AgentType = AgentType.REINFORCE,
+        n_steps:int = 5,
+        environment:str = 'LunarLander-v2'
+        ) -> None:
         
-        self.actor_optimizer = th.optim.Adam(self.actor.parameters(), lr=alpha)
-        self.critic_optimizer = None if model == AgentType.REINFORCE else th.optim.Adam(self.critic.parameters(), lr=alpha)
-        
-        self.alpha = alpha
+        self.alpha_policy = alpha_policy
+        self.alpha_critic = alpha_critic
         self.beta = beta
         self.gamma = gamma
-        self.model = model
+        self.agent_type = agent_type
         self.n_steps = n_steps
+        self.env = gym.make(environment, continuous=False)
+        self.device = th.device('cuda' if th.cuda.is_available() else 'cpu')
+
+        self.state_space_size = self.env.observation_space.shape[0]
+        self.action_space_size = self.env.action_space.n
+
+        self.model = Policy(input_size=self.state_space_size, output_size=self.action_space_size).to(self.device)
+        self.optimizer = th.optim.Adam(self.model.parameters(), lr=self.alpha_policy)
+
+        if self.agent_type != AgentType.REINFORCE:
+            self.critic = Critic(input_size=self.state_space_size).to(self.device)
+            self.critic_optimizer = th.optim.Adam(self.critic.parameters(), lr=self.alpha_critic)
 
 
-    def __get_trace(self) -> tuple[Trace, float]:
+    def save_model(self, model:th.nn.Module, path:str) -> None:
         """
-            The private method to get the trace of the agent.
-
-            Returns:
-                Trace: The trace of the agent.
-                float: The entropy of the trace.
-        """
-
-        rewards = []
-        values = []
-        log_probs = []
-        entropy = 0.0
-
-        state, _ = self.env.reset()
-        done = False
-
-        while not done:
-            state = th.from_numpy(state).to(self.device)
-
-            probs = self.actor(state)
-            value = self.critic(state).item() if self.model != AgentType.REINFORCE else 0.0
-
-            action = np.random.choice(self.action_space, p=probs.cpu().detach().numpy())
-            log_prob = th.log(probs[action])
-            log_probs.append(log_prob.item())
-            
-            entropy += -(probs * th.log(probs)).sum().item()
-            
-            state, reward, terminated, truncated, _ = self.env.step(action)
-
-            rewards.append(reward)
-            values.append(value)
-
-            done = terminated or truncated
-        
-        rewards = np.array(rewards, dtype=np.float32)
-        values = np.array(values, dtype=np.float32)
-        log_probs = np.array(log_probs, dtype=np.float32)
-
-        return Trace(rewards, values, log_probs), entropy
-        
-    def __get_discounted_rewards(self, rewards: np.ndarray) -> np.ndarray:
-        """
-            The private method to get the discounted rewards.
+            The save_model function is responsible for saving the model to a file.
 
             Args:
-                rewards (np.ndarray): The rewards of the agent.
-
-            Returns:
-                np.ndarray: The discounted rewards.
+                model (th.nn.Module): The model to be saved.
+                path (str): The path to save the model.
         """
+        th.save(model.state_dict(), path)
 
-        discounted_rewards = np.zeros_like(rewards, dtype=np.float32)
-        running_add = 0.0
-
-        for i in reversed(range(len(rewards))):
-            running_add = running_add * self.gamma + rewards[i]
-            discounted_rewards[i] = running_add
-
-        return discounted_rewards
-
-    def __get_cumulative_returns(self, rewards: np.ndarray, values: np.ndarray) -> np.ndarray:
+    def load_model(self, model:th.nn.Module, path:str) -> th.nn.Module:
         """
-            The private method to get the cumulative returns.
+            The load_model function is responsible for loading the model from a file.
 
             Args:
-                rewards (np.ndarray): The rewards of the agent.
-                values (np.ndarray): The values of the agent.
-
-            Returns:
-                np.ndarray: The cumulative returns.
+                model (th.nn.Module): The model to be loaded.
+                path (str): The path to load the model.
         """
-
-        cumulative_returns = np.zeros_like(rewards, dtype=np.float32)
-
-        for t in range(len(cumulative_returns)):
-            n = min(self.n_steps, len(cumulative_returns) - t - 1)
-            for k in range(n):
-                cumulative_returns[t] += rewards[t+k] + values[t+n]
-
-        return cumulative_returns
-    
-    def __get_actor_loss(self, returns: np.ndarray, log_probs: np.ndarray, values: np.ndarray, entropy: float) -> th.Tensor:
-        """
-            The private method to get the actor loss.
-
-            Args:
-                returns (np.ndarray): The returns of the agent.
-                log_probs (np.ndarray): The log probabilities of the agent.
-                values (np.ndarray): The values of the agent.
-                entropy (float): The entropy of the agent.
-
-            Returns:
-                th.Tensor: The actor loss.
-        """
-
-        actor_loss = 0.0
-
-        
-        for i in range(len(returns)):
-            if self.model == AgentType.REINFORCE:
-                actor_loss += -log_probs[i] * returns[i]
-            else:
-                advantage = returns[i] - values[i]
-                actor_loss += -log_probs[i] * advantage
-
-        actor_loss = actor_loss - self.beta * entropy
-
-        return th.tensor(actor_loss, dtype=th.float32, device=self.device, requires_grad=True)
-    
-    def __get_critic_loss(self, returns: np.ndarray, values: np.ndarray) -> th.Tensor:
-        """
-            The private method to get the critic loss.
-
-            Args:
-                returns (np.ndarray): The returns of the agent.
-                values (np.ndarray): The values of the agent.
-
-            Returns:
-                th.Tensor: The critic loss.
-        """
-
-        critic_loss = th.tensor(np.sum((returns - values) ** 2), dtype=th.float32, device=self.device, requires_grad=True)
-
-        return critic_loss
+        model.load_state_dict(th.load(path))
+        return model
     
     def __print_training_trajectory(self, i: int, m:int, actor_loss: th.Tensor, critic_loss: th.Tensor, rewards: np.ndarray, entropy:float) -> None:
         """
@@ -212,74 +103,155 @@ class Agent():
                 entropy (float): The entropy of the agent.
         """
 
+        color = lambda x: termcolor.colored(x, "green") if x > 0 else termcolor.colored(x, "yellow") if x > -100.0 else termcolor.colored(x, "red")
+        avg_reward = np.round(np.mean(rewards), ROUNDING_PRECISION)
+
         print(f"Episode {i}/{m}", end="\t")
-        if self.model != AgentType.REINFORCE:
+        if self.agent_type != AgentType.REINFORCE:
             print(f"Actor Loss: {actor_loss:.{ROUNDING_PRECISION}f}\tCritic Loss: {critic_loss:.{ROUNDING_PRECISION}f}", end="\t")
         else:
             print(f"Model Loss: {actor_loss:.{ROUNDING_PRECISION}f}", end="\t")
 
-        print("Current average reward: ", end="")
-        avg_reward = np.round(np.mean(rewards), ROUNDING_PRECISION)
-        color = "green" if avg_reward > 0 else "yellow" if avg_reward > -100.0 else "red" 
-        print(termcolor.colored(avg_reward, color), end="\t")
+        print(f"Current average reward: {color(avg_reward)}", end="\t")
+        print(f"Last episode reward: {color(np.round(rewards[-1], ROUNDING_PRECISION))}", end="\t")
         print(f"Entropy: {entropy:.{ROUNDING_PRECISION}f}")
 
-    def train(self, m:int, quiet=False) -> np.ndarray:
+    def __get_trace(self) -> tuple[th.Tensor, th.Tensor, th.Tensor, float]:
         """
-            Train the agent for m episodes.
-
-            Args:
-                m (int): The number of episodes to train the agent.
-                quiet (bool): Whether to print training trajectory.
+            The private method to get the trace of the agent.
 
             Returns:
-                np.ndarray: The rewards of the agent for each episode.
+                tuple[th.Tensor, th.Tensor, th.Tensor, float]: The tuple of the episode rewards, log probabilities, values and entropy.
         """
+        state, _ = self.env.reset()
+        done = False 
+        entropy = 0.0
+        episode_rewards = []
+        episode_log_probs = []
+        episode_values = []
 
-        rewards_per_episode = np.zeros(m, dtype=np.float32)
-
-
-        for i in range(m):
-            trace, entropy = self.__get_trace()
-
-            if self.model == AgentType.ACBoostrapping or self.model == AgentType.ACBoostrappingBaseline:
-                returns = self.__get_cumulative_returns(trace.rewards, trace.values)
+        while not done:
+            probs = self.model(th.tensor(state).float().to(self.device))
+            if self.agent_type != AgentType.REINFORCE:
+                value = self.critic(th.tensor(state).float().to(self.device))   
             else:
-                returns = self.__get_discounted_rewards(trace.rewards)
+                value = th.tensor(0.0)
 
-            actor_loss = self.__get_actor_loss(returns, trace.log_probs, trace.values, entropy)
+            episode_values.append(value)
 
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+            action = np.random.choice(self.action_space_size, p=probs.detach().cpu().numpy())
+            
 
-            if self.model != AgentType.REINFORCE:
-                critic_loss = self.__get_critic_loss(returns, trace.values)
-                
-                self.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                self.critic_optimizer.step()
+            log_prob = th.log(probs[action])
+            episode_log_probs.append(log_prob)
 
-            rewards_per_episode[i] = np.sum(trace.rewards)
+            entropy += -(probs * th.log(probs)).sum()
 
-            if not quiet and i % 10 == 0 and i != 0:
-                self.__print_training_trajectory(i, 
-                        m, 
-                        actor_loss, 
-                        critic_loss if self.model != AgentType.REINFORCE else None, 
-                        rewards_per_episode, 
-                        entropy)
+            state, reward, terminated, truncated, _ = self.env.step(action)
 
-        return rewards_per_episode
+            episode_rewards.append(reward)
+            done = terminated or truncated
+
+        episode_rewards = th.tensor(episode_rewards).to(self.device)
+        episode_log_probs = th.stack(episode_log_probs)
+        episode_values = th.stack(episode_values)
+
+        return episode_rewards, episode_log_probs, episode_values, entropy
     
+    def __get_discounted_rewards(self, rewards:th.Tensor) -> th.Tensor:
+        """
+            The private method to get the discounted rewards.
 
-if __name__ == "__main__":
-    agent = Agent(model=AgentType.ACBoostrappingBaseline)
-    rewards = agent.train(5000)
+            Args:
+                rewards (th.Tensor): The rewards of the agent.
+            
+            Returns:
+                th.Tensor: The discounted rewards.
+        """
+        discounted_rewards = th.zeros(len(rewards)).to(self.device)
+        R = 0
 
-    smoothed_rewards = np.convolve(rewards, np.ones((100,))/100, mode="valid")
+        for i, reward in enumerate(reversed(rewards)):
+            R = reward + self.gamma * R
+            discounted_rewards[i] = R
 
+        discounted_rewards = discounted_rewards.flip(dims=(0,))
+
+        return discounted_rewards
+    
+    def __get_policy_loss(self, log_probs:th.Tensor, 
+                          discounted_rewards:th.Tensor, 
+                          values:th.Tensor, 
+                          entropy:float) -> th.Tensor:
+        """
+            The private method to get the policy loss.
+
+            Args:
+                log_probs (th.Tensor): The log probabilities of the agent.
+                discounted_rewards (th.Tensor): The discounted rewards of the agent.
+                values (th.Tensor): The values of the agent.
+                entropy (float): The entropy of the agent.
+
+            Returns:
+                th.Tensor: The policy loss.
+        """
+        policy_loss = th.tensor(0.0, requires_grad=True).to(self.device)
+
+        for log_prob, reward, value in zip(log_probs, discounted_rewards, values):
+            if self.agent_type != AgentType.REINFORCE:
+                advantage = reward - value
+            else:
+                advantage = reward
+            
+            policy_loss += -log_prob * advantage
+
+        policy_loss -= self.beta * entropy
+
+        return policy_loss
+    
+    def __get_critic_loss(self, values:th.Tensor, returns:th.Tensor) -> th.Tensor:
+        """
+            The private method to get the critic loss.
+
+            Args:
+                values (th.Tensor): The values of the agent.
+                returns (th.Tensor): The returns of the agent.
+
+            Returns:
+                th.Tensor: The critic loss.
+        """
+        critic_loss = th.tensor(0.0, requires_grad=True).to(self.device)
+
+        for value, ret in zip(values, returns):
+            critic_loss += (value - ret) ** 2
+
+        return critic_loss 
+    
+    def train(self, n_episodes) -> list[float]:
+        rewards: list[float] = []
+
+        for m in range(n_episodes):
+            episode_rewards, episode_log_probs, episode_values, entropy = self.__get_trace()
+            discounted_rewards = self.__get_discounted_rewards(episode_rewards)
+
+            policy_loss = self.__get_policy_loss(episode_log_probs, discounted_rewards, episode_values, entropy)
+
+            self.optimizer.zero_grad()
+            policy_loss.backward()
+            self.optimizer.step()
+
+            rewards.append(sum(episode_rewards).item())
+
+            self.__print_training_trajectory(m+1, n_episodes, policy_loss, th.tensor(0.0), rewards, entropy)
+
+        return rewards 
+
+if __name__ == '__main__':
+    agent = Agent()
+    rewards = agent.train(1000)
     plt.plot(rewards)
-    plt.xlabel("Episodes")
-    plt.ylabel("Rewards")
-    plt.savefig("rewards.png")
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.title('REINFORCE')
+    plt.savefig('reinforce.png')
+    plt.show()
