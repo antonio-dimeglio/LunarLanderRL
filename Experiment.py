@@ -16,7 +16,7 @@ def experiment_different_agent():
         AgentType.ACBoostrappingBaseline
     ]
 
-    num_episodes = 10000
+    num_episodes = 1000
 
     for agent_type in agent_types:
         print(f'Running {agent_type}.')

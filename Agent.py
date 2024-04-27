@@ -46,7 +46,7 @@ class Agent():
         beta:float = 0.01,
         gamma:float = 0.99,
         agent_type:AgentType = AgentType.REINFORCE,
-        n_steps:int = 10,
+        n_steps:int = 5,
         environment:str = 'LunarLander-v2'
         ) -> None:
         
@@ -112,10 +112,10 @@ class Agent():
         avg_reward = np.round(np.mean(rewards), ROUNDING_PRECISION)
 
         if self.agent_type != AgentType.REINFORCE:
-            d["Actor Loss"] = f"{actor_loss:.{ROUNDING_PRECISION}}"
-            d["Critic Loss"] = f"{critic_loss:.{ROUNDING_PRECISION}f}"
+            d["Actor Loss"] = f"{actor_loss:1.{ROUNDING_PRECISION}}"
+            d["Critic Loss"] = f"{critic_loss:1.{ROUNDING_PRECISION}}"
         else:
-            d["Model Loss"]  = f"{actor_loss:.{ROUNDING_PRECISION}f}"
+            d["Model Loss"]  = f"{actor_loss:1.{ROUNDING_PRECISION}}"
 
         d["Avg Reward"] = f"{color(avg_reward)}"
         d["Last reward"] =  f"{color(np.round(rewards[-1], ROUNDING_PRECISION))}"
@@ -148,7 +148,6 @@ class Agent():
 
             action = np.random.choice(self.action_space_size, p=probs.detach().cpu().numpy())
             
-
             log_prob = th.log(probs[action])
             episode_log_probs.append(log_prob)
 
@@ -199,12 +198,14 @@ class Agent():
         """
 
         cumulative_returns = th.zeros(len(rewards), dtype=th.float).to(self.device)
+        discounts = th.tensor([self.gamma ** i for i in range(self.n_steps)]).to(self.device)
 
         for t in range(len(cumulative_returns)):
             n = min(self.n_steps, len(cumulative_returns) - t - 1)
-            for k in range(n):
-                cumulative_returns[t] += rewards[t + k] * (self.gamma ** k) + rewards[t+k] + (self.gamma **n) * values[t+n]
-
+            if t + n < len(cumulative_returns):
+                cumulative_returns[t] = th.sum(rewards[t:t+n] * discounts[:n]) + discounts[n-1] * values[t+n]
+            else:
+                cumulative_returns[t] = th.sum(rewards[t:] * discounts[:len(rewards) - t]) + discounts[-1] * values[-1]
         return cumulative_returns
     
     def __get_policy_loss(self, log_probs:th.Tensor, 
@@ -225,15 +226,12 @@ class Agent():
         """
         policy_loss = th.tensor(0.0, requires_grad=True).to(self.device)
 
-        for log_prob, reward, value in zip(log_probs, discounted_rewards, values):
-            if self.agent_type == AgentType.ACBaseline or self.agent_type == AgentType.ACBoostrappingBaseline:
-                advantage = reward - value
-            else:
-                advantage = reward
-            
-            policy_loss += -log_prob * advantage
+        if self.agent_type == AgentType.ACBaseline or self.agent_type == AgentType.ACBoostrappingBaseline:
+            advantage = discounted_rewards - values
+        else:
+            advantage = discounted_rewards
 
-        policy_loss -= self.beta * entropy
+        policy_loss = -th.sum(log_probs * advantage) - self.beta * entropy
 
         return policy_loss
     
@@ -250,8 +248,7 @@ class Agent():
         """
         critic_loss = th.tensor(0.0, requires_grad=True).to(self.device)
 
-        for value, ret in zip(values, returns):
-            critic_loss += (value - ret) ** 2
+        critic_loss = th.sum((values - returns) ** 2)
 
         return critic_loss 
     
