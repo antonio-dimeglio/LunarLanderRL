@@ -8,6 +8,7 @@ def smooth(x, window=100):
 
 
 def experiment_different_agent():
+    print('Running experiment_different_agent.')
     agent_types = [
         AgentType.REINFORCE,
         AgentType.ACBaseline,
@@ -15,12 +16,14 @@ def experiment_different_agent():
         AgentType.ACBoostrappingBaseline
     ]
 
-    num_episodes = 1000
+    num_episodes = 10000
 
     for agent_type in agent_types:
-        agent = Agent(model=agent_type)
-        rewards = agent.train(m=num_episodes)
+        print(f'Running {agent_type}.')
+        agent = Agent(agent_type=agent_type)
+        rewards = agent.train(num_episodes)
         plt.plot(smooth(rewards), label=agent_type)
+        print(f'{agent_type} done.')
 
     plt.legend()
     plt.xlabel('Episode')
@@ -28,6 +31,7 @@ def experiment_different_agent():
     plt.title('Different Agent Comparison')
     plt.savefig('different_agent_comparison.png')
 
+    print('Experiment done.')
 
 
 
