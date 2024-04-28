@@ -6,6 +6,7 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import termcolor
 from enum import Enum
+import cma
 
 ROUNDING_PRECISION = 2
 
@@ -15,13 +16,13 @@ class AgentType(Enum):
 
         Attributes:
             ACBaseline (int): The Actor-Critic model with Baseline Subtraction.
-            ACBoostrapping (int): The Actor-Critic model with Boostrapping.
-            ACBoostrappingBaseline (int): The Actor-Critic model with both Boostrapping and Baseline Subtraction.
+            ACBootstrapping (int): The Actor-Critic model with Boostrapping.
+            ACBootstrappingBaseline (int): The Actor-Critic model with both Boostrapping and Baseline Subtraction.
             REINFORCE (int): The REINFORCE model.
     """
     ACBaseline = 0
-    ACBoostrapping = 1
-    ACBoostrappingBaseline = 2
+    ACBootstrapping = 1
+    ACBootstrappingBaseline = 2
     REINFORCE = 3
 
 class Agent():
@@ -46,7 +47,7 @@ class Agent():
         beta:float = 0.01,
         gamma:float = 0.99,
         agent_type:AgentType = AgentType.REINFORCE,
-        n_steps:int = 5,
+        n_steps:int = 20,
         environment:str = 'LunarLander-v2'
         ) -> None:
         
@@ -201,11 +202,11 @@ class Agent():
         discounts = th.tensor([self.gamma ** i for i in range(self.n_steps)]).to(self.device)
 
         for t in range(len(cumulative_returns)):
-            n = min(self.n_steps, len(cumulative_returns) - t - 1)
+            n = min(self.n_steps, len(cumulative_returns) - t)
             if t + n < len(cumulative_returns):
                 cumulative_returns[t] = th.sum(rewards[t:t+n] * discounts[:n]) + discounts[n-1] * values[t+n]
             else:
-                cumulative_returns[t] = th.sum(rewards[t:] * discounts[:len(rewards) - t]) + discounts[-1] * values[-1]
+                cumulative_returns[t] = th.sum(rewards[t:] * discounts[:n]) + discounts[-1] * values[-1]
         return cumulative_returns
     
     def __get_policy_loss(self, log_probs:th.Tensor, 
@@ -226,7 +227,7 @@ class Agent():
         """
         policy_loss = th.tensor(0.0, requires_grad=True).to(self.device)
 
-        if self.agent_type == AgentType.ACBaseline or self.agent_type == AgentType.ACBoostrappingBaseline:
+        if self.agent_type == AgentType.ACBaseline or self.agent_type == AgentType.ACBootstrappingBaseline:
             advantage = discounted_rewards - values
         else:
             advantage = discounted_rewards
@@ -250,30 +251,35 @@ class Agent():
 
         critic_loss = th.sum((values - returns) ** 2)
 
-        return critic_loss 
+        return critic_loss
     
-    def train(self, n_episodes) -> list[float]:
+    def train(self, n_episodes, measure_loss_variance:bool = True) -> tuple[list[float], list[float]] | list[float]:
         rewards: list[float] = []
+        loss_variances: list[float] = []
 
         for _ in (progress_bar := tqdm(range(n_episodes), position=0, leave=True)):
             episode_rewards, episode_log_probs, episode_values, entropy = self.__get_trace()
-            if self.agent_type == AgentType.ACBoostrapping or self.agent_type == AgentType.ACBoostrappingBaseline:
+            if self.agent_type == AgentType.ACBootstrapping or self.agent_type == AgentType.ACBootstrappingBaseline:
                 r = self.__get_cumulative_returns(episode_rewards, episode_values)
             else:
                 r = self.__get_discounted_rewards(episode_rewards)
             
             policy_loss = self.__get_policy_loss(episode_log_probs, r, episode_values, entropy)
 
+            loss_variances.append(policy_loss.item())
 
             self.optimizer.zero_grad()
             policy_loss.backward(retain_graph=True if self.agent_type != AgentType.REINFORCE else False)
             self.optimizer.step()
+
+            
 
             if self.agent_type != AgentType.REINFORCE:
                 critic_loss = self.__get_critic_loss(episode_values, r)
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
                 self.critic_optimizer.step()
+
 
             rewards.append(sum(episode_rewards).item())
 
@@ -285,16 +291,20 @@ class Agent():
             
             progress_bar.set_postfix(traj_dict)
             
-            
+        if measure_loss_variance:
+            return rewards, loss_variances
+        else:
+            return rewards
 
-        return rewards 
 
 if __name__ == '__main__':
-    agent = Agent(agent_type=AgentType.ACBoostrappingBaseline)
-    rewards = agent.train(1000)
-    plt.plot(rewards)
-    plt.xlabel('Episode')
-    plt.ylabel('Total Reward')
-    plt.title('REINFORCE')
-    plt.savefig('reinforce.png')
-    plt.show()
+    agent = Agent(agent_type=AgentType.ACBootstrappingBaseline)
+    rewards, gradients = agent.train(1000)
+    rewards = np.convolve(rewards, np.ones(100), 'valid') / 100
+    gradients = np.convolve(gradients, np.ones(100), 'valid') / 100
+    fig, ax = plt.subplots(2, 1, figsize=(10, 10))
+    ax[0].plot(rewards)
+    ax[0].set_title('Rewards')
+    ax[1].plot(gradients)
+    ax[1].set_title('Gradient Variance')
+    plt.savefig('rewards_gradients.png')
