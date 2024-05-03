@@ -1,0 +1,15 @@
+name: rllunarlander
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - gymnasium
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - matplotlib
+  - scipy
+  - numpy
+  - tqdm
+  - tabulate

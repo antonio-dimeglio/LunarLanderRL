@@ -6,7 +6,7 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import termcolor
 from enum import Enum
-import cma
+from torch.distributions import Categorical
 
 ROUNDING_PRECISION = 2
 
@@ -19,11 +19,13 @@ class AgentType(Enum):
             ACBootstrapping (int): The Actor-Critic model with Boostrapping.
             ACBootstrappingBaseline (int): The Actor-Critic model with both Boostrapping and Baseline Subtraction.
             REINFORCE (int): The REINFORCE model.
+            PPOClip (int): The Clipped Proximal Policy Optimization model.
     """
     ACBaseline = 0
     ACBootstrapping = 1
     ACBootstrappingBaseline = 2
     REINFORCE = 3
+    PPOClip = 4
 
 class Agent():
     """
@@ -57,7 +59,7 @@ class Agent():
         self.gamma = gamma
         self.agent_type = agent_type
         self.n_steps = n_steps
-        self.env = gym.make(environment, continuous=False)
+        self.env = gym.make(environment)
         self.device = th.device('cuda' if th.cuda.is_available() else 'cpu')
 
         self.state_space_size = self.env.observation_space.shape[0]
@@ -69,7 +71,6 @@ class Agent():
         if self.agent_type != AgentType.REINFORCE:
             self.critic = Critic(input_size=self.state_space_size).to(self.device)
             self.critic_optimizer = th.optim.Adam(self.critic.parameters(), lr=self.alpha_critic)
-
 
     def save_model(self, model:th.nn.Module, path:str) -> None:
         """
@@ -139,15 +140,16 @@ class Agent():
         episode_values = []
 
         while not done:
-            probs = self.model(th.tensor(state).float().to(self.device))
+            state = th.tensor(state).to(self.device)
+            probs = self.model(state)
             if self.agent_type != AgentType.REINFORCE:
-                value = self.critic(th.tensor(state).float().to(self.device))   
+                value = self.critic(state)   
             else:
                 value = th.tensor(0.0)
 
             episode_values.append(value)
-
-            action = np.random.choice(self.action_space_size, p=probs.detach().cpu().numpy())
+            distrib = Categorical(probs)
+            action = distrib.sample().item()
             
             log_prob = th.log(probs[action])
             episode_log_probs.append(log_prob)
@@ -158,6 +160,8 @@ class Agent():
 
             episode_rewards.append(reward)
             done = terminated or truncated
+
+
 
         episode_rewards = th.tensor(episode_rewards).to(self.device)
         episode_log_probs = th.stack(episode_log_probs).to(self.device)
@@ -227,12 +231,14 @@ class Agent():
         """
         policy_loss = th.tensor(0.0, requires_grad=True).to(self.device)
 
+
         if self.agent_type == AgentType.ACBaseline or self.agent_type == AgentType.ACBootstrappingBaseline:
             advantage = discounted_rewards - values
         else:
             advantage = discounted_rewards
 
         policy_loss = -th.sum(log_probs * advantage) - self.beta * entropy
+ 
 
         return policy_loss
     
@@ -252,32 +258,38 @@ class Agent():
         critic_loss = th.sum((values - returns) ** 2)
 
         return critic_loss
-    
+
     def train(self, n_episodes, measure_loss_variance:bool = True) -> tuple[list[float], list[float]] | list[float]:
         rewards: list[float] = []
         loss_variances: list[float] = []
 
         for _ in (progress_bar := tqdm(range(n_episodes), position=0, leave=True)):
             episode_rewards, episode_log_probs, episode_values, entropy = self.__get_trace()
-            if self.agent_type == AgentType.ACBootstrapping or self.agent_type == AgentType.ACBootstrappingBaseline:
+            if self.agent_type in [AgentType.ACBootstrapping, AgentType.ACBootstrappingBaseline]:
                 r = self.__get_cumulative_returns(episode_rewards, episode_values)
             else:
                 r = self.__get_discounted_rewards(episode_rewards)
+
             
             policy_loss = self.__get_policy_loss(episode_log_probs, r, episode_values, entropy)
-
             loss_variances.append(policy_loss.item())
 
+
             self.optimizer.zero_grad()
-            policy_loss.backward(retain_graph=True if self.agent_type != AgentType.REINFORCE else False)
+            if self.agent_type != AgentType.REINFORCE:
+                policy_loss.backward(retain_graph=True)
+                th.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+            else:
+                policy_loss.backward()
+
             self.optimizer.step()
 
-            
 
             if self.agent_type != AgentType.REINFORCE:
                 critic_loss = self.__get_critic_loss(episode_values, r)
                 self.critic_optimizer.zero_grad()
-                critic_loss.backward()
+                critic_loss.backward(retain_graph=False)
+                th.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.critic_optimizer.step()
 
 
@@ -295,16 +307,3 @@ class Agent():
             return rewards, loss_variances
         else:
             return rewards
-
-
-if __name__ == '__main__':
-    agent = Agent(agent_type=AgentType.ACBootstrappingBaseline)
-    rewards, gradients = agent.train(1000)
-    rewards = np.convolve(rewards, np.ones(100), 'valid') / 100
-    gradients = np.convolve(gradients, np.ones(100), 'valid') / 100
-    fig, ax = plt.subplots(2, 1, figsize=(10, 10))
-    ax[0].plot(rewards)
-    ax[0].set_title('Rewards')
-    ax[1].plot(gradients)
-    ax[1].set_title('Gradient Variance')
-    plt.savefig('rewards_gradients.png')
